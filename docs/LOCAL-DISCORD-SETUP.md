@@ -35,3 +35,37 @@ Discord can list tasks and create tasks.
 Task #1: Nokia IMS Interview Preparation.
 Initial status: inbox. Priority: medium.
 Task creation does not itself start autonomous task execution.
+
+## macOS background service
+
+Mission Control starts at login through:
+~/Library/LaunchAgents/com.raghunandan.mission-control.plist
+
+Open the dashboard at http://127.0.0.1:3000.
+
+### Stop before rebuilding
+launchctl bootout "gui/$(id -u)/com.raghunandan.mission-control"
+
+### Rebuild
+pnpm build
+
+### Refresh standalone assets
+mkdir -p .next/standalone/.next/static .next/standalone/public
+cp -R .next/static/. .next/standalone/.next/static/
+cp -R public/. .next/standalone/public/
+
+### Start after rebuilding
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.raghunandan.mission-control.plist"
+
+### Check errors
+tail -n 40 "$HOME/.mission-control/logs/server-error.log"
+
+### Agent API key
+The main agent credential is stored outside Git:
+~/.openclaw/credentials/mission-control-main.json
+
+Its expiry is determined when the key is created.
+Use expires_in_days: 365 when creating a one-year replacement.
+Changing documentation does not extend an existing key.
+Never commit credentials or private data.
