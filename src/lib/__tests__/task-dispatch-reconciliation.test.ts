@@ -85,9 +85,18 @@ vi.mock('../db', () => ({
           },
         }
       }
-      if (sql === 'UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ?') {
+      if (sql.startsWith('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')) {
         return {
           run: (metadata: string, _updatedAt: number, taskId: number) => {
+            mockDbState.metadataUpdates.push({ metadata, taskId })
+            return { changes: 1 }
+          },
+        }
+      }
+      if (sql.includes('UPDATE tasks') && sql.includes("status = 'blocked'")) {
+        return {
+          run: (_error: string, metadata: string, _now: number, taskId: number) => {
+            mockDbState.statusUpdates.push({ status: 'blocked', taskId })
             mockDbState.metadataUpdates.push({ metadata, taskId })
             return { changes: 1 }
           },
@@ -140,7 +149,8 @@ vi.mock('../sessions', () => ({
   getAllGatewaySessions: mockDbState.getAllGatewaySessions,
 }))
 
-vi.mock('../transcript-parser', () => ({
+vi.mock('../transcript-parser', async () => ({
+  ...(await vi.importActual<typeof import('../transcript-parser')>('../transcript-parser')),
   readSessionJsonl: mockDbState.readSessionJsonl,
   parseJsonlTranscript: (raw: string, limit: number) => raw
     .split('\n')
@@ -313,26 +323,108 @@ describe('deferred task completion reconciliation', () => {
     expect(mockDbState.updates).toHaveLength(0)
   })
 
-  it('promotes completed runs with a fallback resolution when no text is returned', async () => {
+  it('does not promote a completed run with missing text to review', async () => {
     mockDbState.tasks = [{
-      id: 14,
-      title: 'Empty output task',
-      assigned_to: null,
+      id: 14, title: 'Empty output task', assigned_to: null,
       metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-456' }),
       workspace_id: 1,
     }]
-    const waitForRun = vi.fn(async () => ({ complete: true, text: null }))
-
-    const result = await reconcileDeferredTaskCompletions({ waitForRun })
-
-    expect(result.promoted).toBe(1)
-    expect(mockDbState.updates[0].resolution).toBe('Deferred agent run completed without textual output.')
-    expect(mockDbState.comments[0]).toMatchObject({
-      taskId: 14,
-      author: 'agent',
-      content: 'Deferred agent run completed without textual output.',
-      workspaceId: 1,
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
     })
+    expect(result.promoted).toBe(0)
+    expect(mockDbState.updates).toHaveLength(0)
+    expect(mockDbState.comments).toHaveLength(0)
+    expect(JSON.parse(mockDbState.metadataUpdates[0].metadata)).toMatchObject({
+      async_state: 'pending', output_recovery_attempts: 1,
+    })
+  })
+
+  it('blocks missing output after three recovery checks without redispatch or review', async () => {
+    mockDbState.tasks = [{
+      id: 14, title: 'Empty output task', assigned_to: null,
+      metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-456', output_recovery_attempts: 2 }),
+      workspace_id: 1,
+    }]
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
+    })
+    expect(result.promoted).toBe(0)
+    expect(mockDbState.statusUpdates).toEqual([{ status: 'blocked', taskId: 14 }])
+    expect(JSON.parse(mockDbState.metadataUpdates[0].metadata).async_state).toBe('output_missing')
+    expect(mockDbState.comments).toHaveLength(0)
+    expect(mockDbState.callOpenClawGateway).not.toHaveBeenCalled()
+  })
+
+  it('recovers final text through gateway history without JSONL files', async () => {
+    mockDbState.tasks = [{
+      id: 31, title: 'SQLite output', assigned_to: 'main', workspace_id: 1,
+      metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-31',
+        dispatch_session_key: 'agent:main:mission-control:task-31-unique' }),
+    }]
+    mockDbState.callOpenClawGateway.mockResolvedValue({ messages: [
+      { role: 'user', content: '**[TASK-31] SQLite output**' },
+      { role: 'assistant', content: 'Starting research.' },
+      { role: 'tool', content: 'Tool output is not the deliverable.' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Saved guide.md. All requirements verified.' }] },
+    ] })
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
+    })
+    expect(result.promoted).toBe(1)
+    expect(mockDbState.updates[0].resolution).toBe('Saved guide.md. All requirements verified.')
+    expect(mockDbState.callOpenClawGateway).toHaveBeenCalledWith('chat.history', {
+      sessionKey: 'agent:main:mission-control:task-31-unique', limit: 200,
+    }, 15000)
+    expect(mockDbState.readSessionJsonl).not.toHaveBeenCalled()
+  })
+
+  it.each(['TASK-310', 'TASK-32'])('does not use another task marker %s', async (marker) => {
+    mockDbState.tasks = [{
+      id: 31, title: 'SQLite output', assigned_to: 'main', workspace_id: 1,
+      metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-31',
+        dispatch_session_key: 'agent:main:mission-control:task-31-unique' }),
+    }]
+    mockDbState.callOpenClawGateway.mockResolvedValue({ messages: [
+      { role: 'user', content: `**[${marker}] Other task**` },
+      { role: 'assistant', content: 'Unrelated result.' },
+    ] })
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
+    })
+    expect(result.promoted).toBe(0)
+    expect(mockDbState.updates).toHaveLength(0)
+  })
+
+  it('does not read another user turn as this task completion', async () => {
+    mockDbState.tasks = [{
+      id: 31, title: 'SQLite output', assigned_to: 'main', workspace_id: 1,
+      metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-31',
+        dispatch_session_key: 'agent:main:mission-control:task-31-unique' }),
+    }]
+    mockDbState.callOpenClawGateway.mockResolvedValue({ messages: [
+      { role: 'user', content: '**[TASK-31] SQLite output**' },
+      { role: 'user', content: 'Another question.' },
+      { role: 'assistant', content: 'Unrelated answer.' },
+    ] })
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
+    })
+    expect(result.promoted).toBe(0)
+  })
+
+  it('does not guess main-session history or recover unrelated disk output on RPC failure', async () => {
+    mockDbState.tasks = [{
+      id: 31, title: 'SQLite output', assigned_to: 'main', workspace_id: 1,
+      metadata: JSON.stringify({ async_state: 'pending', dispatch_run_id: 'run-31',
+        dispatch_session_key: 'agent:main:mission-control:task-31-unique' }),
+    }]
+    mockDbState.callOpenClawGateway.mockRejectedValue(new Error('history unavailable'))
+    const result = await reconcileDeferredTaskCompletions({
+      waitForRun: async () => ({ complete: true, text: null }),
+    })
+    expect(result.promoted).toBe(0)
+    expect(mockDbState.readSessionJsonl).not.toHaveBeenCalled()
   })
 
   it('recovers completed run text from the agent transcript when wait has no text', async () => {
@@ -537,12 +629,14 @@ describe('existing-session deferred dispatch', () => {
     expect(timeoutMs).toBe(60_000)
     expect(params).toMatchObject({
       agentId: 'arnold',
+      sessionKey: expect.stringMatching(/^agent:arnold:mission-control:task-22-/),
       deliver: false,
     })
     expect(params.model).toBeUndefined()
     const metadata = JSON.parse(mockDbState.metadataUpdates[0].metadata)
     expect(metadata).toMatchObject({
       dispatch_session_id: 'session-22',
+      dispatch_session_key: params.sessionKey,
       dispatch_run_id: 'run-22',
       async_state: 'pending',
     })

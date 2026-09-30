@@ -1,5 +1,6 @@
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { getDatabase, db_helpers } from './db'
 import {
@@ -12,7 +13,7 @@ import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
 import { getAllGatewaySessions } from './sessions'
-import { parseJsonlTranscript, readSessionJsonl, type TranscriptMessage } from './transcript-parser'
+import { parseGatewayHistoryTranscript, parseJsonlTranscript, readSessionJsonl, type TranscriptMessage } from './transcript-parser'
 import { syncTaskOutbound } from './github-sync-engine'
 import { classifyModelProvider, getDispatchModelId, getModelByAlias } from './models'
 import { getMiniMaxApiKey, resolveMiniMaxEndpoint } from './minimax'
@@ -290,6 +291,7 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
   }
 
   lines.push('', 'Complete this task and provide your response. Be concise and actionable.')
+  lines.push('Return a final textual completion report with the result, any saved deliverable paths, and verification against the requirements. Do not finish with only a progress update or NO_REPLY. If blocked, explain the blocker instead of claiming completion.')
   return lines.join('\n')
 }
 
@@ -429,27 +431,50 @@ function getTranscriptText(message: TranscriptMessage): string {
 }
 
 function findAssistantTextAfterTaskPrompt(rawTranscript: string, task: DeferredCompletionTask): string | null {
-  const messages = parseJsonlTranscript(rawTranscript, 2000)
-  if (messages.length === 0) return null
+  return findTaskCompletionText(parseJsonlTranscript(rawTranscript, 2000), task)
+}
 
-  const markers = buildDeferredCompletionMarkers(task).map((marker) => marker.toLowerCase())
-
+function findTaskCompletionText(messages: TranscriptMessage[], task: DeferredCompletionTask): string | null {
+  // Exact marker boundaries prevent TASK-1 from matching TASK-10.
+  const markers = buildDeferredCompletionMarkers(task).map((marker) =>
+    new RegExp(`(^|[^a-z0-9-])${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z0-9-])`, 'i'))
   for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]
-    if (message.role !== 'user') continue
-
-    const userText = getTranscriptText(message).toLowerCase()
-    if (!markers.some((marker) => userText.includes(marker))) continue
-
+    if (messages[i].role !== 'user') continue
+    if (!markers.some((marker) => marker.test(getTranscriptText(messages[i])))) continue
+    let finalText: string | null = null
     for (let j = i + 1; j < messages.length; j++) {
       const candidate = messages[j]
+      if (candidate.role === 'user') break
       if (candidate.role !== 'assistant') continue
       const text = getTranscriptText(candidate)
-      if (text) return text.slice(0, 10_000)
+      // Select the last answer, not an initial progress update.
+      if (text && text !== '[chat.history omitted: message too large]') finalText = text
     }
+    return finalText ? finalText.slice(0, 10_000) : null
   }
-
   return null
+}
+
+async function recoverDeferredCompletionTextFromGateway(
+  task: DeferredCompletionTask, metadata: Record<string, any>,
+): Promise<string | null> {
+  // Only read an exact recorded session; never guess the agent's main session.
+  const sessionKey = typeof metadata.dispatch_session_key === 'string'
+    ? metadata.dispatch_session_key.trim()
+    : typeof metadata.target_session === 'string' ? metadata.target_session.trim() : ''
+  if (!sessionKey) return null
+  try {
+    const history = await callOpenClawGateway<{ messages?: unknown[] }>(
+      'chat.history', { sessionKey, limit: 200 }, 15_000,
+    )
+    // Tool rows must not be normalized into user turns by the shared parser.
+    const rows = (Array.isArray(history?.messages) ? history.messages : [])
+      .filter((row: any) => row?.role === 'user' || row?.role === 'assistant')
+    return findTaskCompletionText(parseGatewayHistoryTranscript(rows, 200), task)
+  } catch (err) {
+    logger.warn({ err, taskId: task.id }, 'Deferred gateway history recovery failed')
+    return null
+  }
 }
 
 function recoverDeferredCompletionTextFromTranscript(
@@ -564,8 +589,35 @@ export async function reconcileDeferredTaskCompletions(options: {
     }
     if (!completion.complete) continue
 
-    const recoveredText = completion.text?.trim() || recoverDeferredCompletionTextFromTranscript(task, metadata)
-    const resolution = recoveredText || 'Deferred agent run completed without textual output.'
+    const recoveredText = completion.text?.trim()
+      || await recoverDeferredCompletionTextFromGateway(task, metadata)
+      || (!metadata.dispatch_session_key && recoverDeferredCompletionTextFromTranscript(task, metadata))
+    if (!recoveredText) {
+      // Allow brief persistence lag, without redispatching or submitting empty reviews.
+      const attempts = Number(metadata.output_recovery_attempts || 0) + 1
+      const exhausted = attempts >= 3
+      const recoveryMetadata = {
+        ...metadata,
+        output_recovery_attempts: attempts,
+        async_state: exhausted ? 'output_missing' : 'pending',
+        async_warning: 'Run completed but no task-specific textual result could be recovered.',
+      }
+      if (exhausted) {
+        const update = db.prepare(`
+          UPDATE tasks SET status = 'blocked', outcome = NULL, error_message = ?, metadata = ?, updated_at = ?
+          WHERE id = ? AND workspace_id = ? AND status = 'in_progress'
+        `).run(recoveryMetadata.async_warning, JSON.stringify(recoveryMetadata), now, task.id, task.workspace_id)
+        if (update.changes) eventBus.broadcast('task.status_changed', {
+          id: task.id, status: 'blocked', previous_status: 'in_progress', workspace_id: task.workspace_id,
+        })
+      } else {
+        db.prepare("UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND status = 'in_progress'")
+          .run(JSON.stringify(recoveryMetadata), now, task.id, task.workspace_id)
+      }
+      logger.warn({ taskId: task.id, attempts }, 'Completed run is missing review evidence')
+      continue
+    }
+    const resolution = recoveredText
     const truncated = resolution.length > 10_000
       ? resolution.substring(0, 10_000) + '\n\n[Response truncated at 10,000 characters]'
       : resolution
@@ -1854,6 +1906,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           ...taskMeta,
           target_session: targetSession,
           dispatch_session_id: targetSession,
+          dispatch_session_key: targetSession,
           ...(dispatchRunId ? { dispatch_run_id: dispatchRunId } : {
             async_reconciliation: 'manual_required',
             async_warning: 'chat.send accepted without a runId; automatic completion reconciliation cannot safely wait on this session.',
@@ -1892,7 +1945,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         // Step 1: Invoke via gateway (new session)
         const gatewayAgentId = resolveGatewayAgentId(task)
         const dispatchModel = resolveTaskDispatchModelOverride(task)
+        const dispatchSessionKey = `agent:${gatewayAgentId}:mission-control:task-${task.id}-${randomUUID()}`
         const invokeParams: Record<string, unknown> = {
+          sessionKey: dispatchSessionKey,
           message: prompt,
           agentId: gatewayAgentId,
           idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
@@ -1924,6 +1979,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         const pendingMeta: Record<string, any> = {
           ...taskMeta,
           dispatch_session_id: dispatchSessionId,
+          dispatch_session_key: dispatchSessionKey,
           ...(dispatchRunId ? { dispatch_run_id: dispatchRunId } : {
             async_reconciliation: 'manual_required',
             async_warning: 'agent dispatch accepted without a runId; automatic completion reconciliation cannot safely wait on this run.',
