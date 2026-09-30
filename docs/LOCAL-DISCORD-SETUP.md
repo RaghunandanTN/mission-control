@@ -24,10 +24,11 @@ tasks:write is not supported by this version.
 The operator key was created with a 30-day expiry.
 
 ## Local data
-The startup script uses .next/standalone/.data.
-Back up this directory privately before rebuilding or deleting .next.
+The startup script uses ~/.mission-control/data.
+Back up this directory privately before upgrades.
 It contains the database and generated credentials.
-Do not commit it to Git.
+Keep it outside Git. The original .next/standalone/.data
+was retained during migration.
 
 ## Verified behavior
 Discord can list tasks and create tasks.

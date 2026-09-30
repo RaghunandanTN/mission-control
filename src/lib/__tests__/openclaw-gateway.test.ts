@@ -43,12 +43,23 @@ beforeAll(async () => {
       }
 
       mocks.requestFrames.push(frame)
+      if (Object.prototype.hasOwnProperty.call(frame, 'expectFinal')) {
+        ws.send(JSON.stringify({
+          type: 'res', id: frame.id, ok: false,
+          error: { message: 'unexpected property expectFinal' },
+        }))
+        return
+      }
       ws.send(JSON.stringify({
-        type: 'res',
-        id: frame.id,
-        ok: true,
-        result: { ok: true, echo: frame.params, expectFinal: frame.expectFinal === true },
+        type: 'res', id: frame.id, ok: true,
+        result: { status: 'accepted' },
       }))
+      setTimeout(() => {
+        ws.send(JSON.stringify({
+          type: 'res', id: frame.id, ok: true,
+          result: { status: 'completed', ok: true, echo: frame.params },
+        }))
+      }, 20)
     })
   })
   await new Promise<void>((resolve) => server.once('listening', () => resolve()))
@@ -106,18 +117,18 @@ describe('callOpenClawGateway', () => {
     )
 
     expect(result).toEqual({
+      status: 'completed',
       ok: true,
-      expectFinal: true,
       echo: {
         message: 'hello',
         deliver: false,
       },
     })
     expect(mocks.requestFrames).toHaveLength(1)
+    expect(mocks.requestFrames[0]).not.toHaveProperty('expectFinal')
     expect(mocks.requestFrames[0]).toMatchObject({
       type: 'req',
       method: 'agent',
-      expectFinal: true,
       params: {
         message: 'hello',
         deliver: false,

@@ -16,6 +16,6 @@ cp -R public/. .next/standalone/public/
 export HOSTNAME=127.0.0.1
 export PORT=3000
 export WS_NO_BUFFER_UTIL=1
-export MISSION_CONTROL_DATA_DIR="$REPO_ROOT/.next/standalone/.data"
+export MISSION_CONTROL_DATA_DIR="$HOME/.mission-control/data"
 
 exec node .next/standalone/server.js
