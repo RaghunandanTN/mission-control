@@ -275,3 +275,19 @@ MC broadcasts events via SSE (`/api/events`) and WebSocket. Key event types:
 - `task.created`, `task.updated`, `task.status_changed`
 
 Subscribe to SSE for live dashboard updates when building integrations.
+
+## Local OpenClaw main agent configuration
+
+- Connect to http://127.0.0.1:3000.
+- Act as the OpenClaw agent named main.
+- Load the api_key field from
+  ~/.openclaw/credentials/mission-control-main.json
+  inside the request process. Never print or expose the credential.
+- When creating a task for main, include assigned_to: "main"
+  in the initial POST /api/tasks body.
+- Use status "assigned" when creating an assigned task.
+- Do not create an unassigned task and then attempt to claim it.
+- Verify creation by reading the returned task ID.
+- If an existing task returns an ownership-related 403, report the
+  restriction and ask the user to assign it through the dashboard.
+  Do not retry with an administrator credential.
